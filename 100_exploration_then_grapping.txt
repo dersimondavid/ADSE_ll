@@ -1,0 +1,172 @@
+import gym
+import numpy as np
+import pybullet as p
+import pybullet_data
+from gym import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+import matplotlib.pyplot as plt
+import time
+
+class StackBlocksEnv(gym.Env):
+    """
+    Gym environment for stacking 10 blocks using a Franka Panda arm in PyBullet.
+    Includes an initial exploration phase and prevents episode timeout mid-grasp.
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, gui=True, max_steps=500, exploration_episodes=100):
+        super(StackBlocksEnv, self).__init__()
+        self.gui = gui
+        self.max_steps = max_steps
+        self.exploration_episodes = exploration_episodes
+        self.episode_count = 0
+
+        # PyBullet setup
+        if self.gui:
+            p.connect(p.GUI)
+        else:
+            p.connect(p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+
+        # Action/obs spaces
+        self.action_space = spaces.Box(-1, 1, shape=(9,), dtype=np.float32)
+        self.num_blocks = 10
+        obs_dim = 7 + self.num_blocks * 3
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
+
+        # Load static scene
+        self._load_static_scene()
+        self.reset()
+
+    def _load_static_scene(self):
+        p.loadURDF("plane.urdf")
+        p.loadURDF("table/table.urdf", [0.5, 0, -0.65], useFixedBase=True)
+        for start, end in [([0.2, -0.2, 0], [0.2, 0.2, 0]),
+                           ([0.2, 0.2, 0], [0.8, 0.2, 0]),
+                           ([0.8, 0.2, 0], [0.8, -0.2, 0]),
+                           ([0.8, -0.2, 0], [0.2, -0.2, 0])]:
+            p.addUserDebugLine(start, end, [1,0,0], 2)
+        self.robot = p.loadURDF("franka_panda/panda.urdf", [0,0,0], useFixedBase=True)
+        self.arm_joints = list(range(7))
+        self.gripper_joints = [9, 11]
+        self.ee_link = 11
+
+    def reset(self):
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.81)
+        self._load_static_scene()
+
+        # Randomize blocks
+        self.block_ids = []
+        for _ in range(self.num_blocks):
+            x = np.random.uniform(0.2, 0.8)
+            y = np.random.uniform(-0.2, 0.2)
+            z = 0.02
+            bid = p.loadURDF("cube.urdf", [x, y, z], globalScaling=0.04/0.5)
+            self.block_ids.append(bid)
+
+        self.step_count = 0
+        self.episode_count += 1
+        return self._get_obs()
+
+    def step(self, action):
+        # Actuate joints
+        for i, j in enumerate(self.arm_joints):
+            curr = p.getJointState(self.robot, j)[0]
+            target = curr + float(action[i]) * 0.05
+            p.setJointMotorControl2(self.robot, j, p.POSITION_CONTROL, target)
+        grip = float(action[7])
+        p.setJointMotorControl2(self.robot, self.gripper_joints[0], p.POSITION_CONTROL, grip)
+        p.setJointMotorControl2(self.robot, self.gripper_joints[1], p.POSITION_CONTROL, grip)
+
+        p.stepSimulation()
+        if self.gui:
+            time.sleep(1./240.)
+        self.step_count += 1
+
+        obs = self._get_obs()
+
+        # Compute rewards
+        shaping = self._compute_shaping_reward()
+        base = self._compute_base_reward() if self.episode_count > self.exploration_episodes else 0
+        reward = shaping + base
+
+        # Determine done
+        done = False
+        # Prevent timeout mid-grasp: if shaping indicates grasp bonus, skip timeout
+        grasping = shaping >= 0.5
+        if self.step_count >= self.max_steps and not grasping:
+            done = True
+        # In training phase, also end when stack complete
+        if self.episode_count > self.exploration_episodes and base >= self.num_blocks:
+            done = True
+
+        return obs, reward, done, {}
+
+    def _get_obs(self):
+        joints = [p.getJointState(self.robot, j)[0] for j in self.arm_joints]
+        blocks = []
+        for bid in self.block_ids:
+            pos, _ = p.getBasePositionAndOrientation(bid)
+            blocks.extend(pos)
+        return np.array(joints + blocks, dtype=np.float32)
+
+    def _compute_shaping_reward(self):
+        # Distance reward to next block + grasp bonus
+        count = self._compute_base_reward()
+        if count < self.num_blocks:
+            next_bid = self.block_ids[count]
+            bp, _ = p.getBasePositionAndOrientation(next_bid)
+            ee = p.getLinkState(self.robot, self.ee_link)[0]
+            d = np.linalg.norm(np.array(ee) - np.array(bp))
+            shaping = max(0, 1 - d/0.5)
+            if bp[2] > 0.06:
+                shaping += 0.5
+            return shaping
+        return 0.0
+
+    def _compute_base_reward(self):
+        count = 0
+        tol = 0.02
+        cx, cy = 0.5, 0.0
+        for i, bid in enumerate(self.block_ids):
+            pos, _ = p.getBasePositionAndOrientation(bid)
+            if abs(pos[2] - (i+0.5)*0.04) < tol and np.hypot(pos[0]-cx, pos[1]-cy) < tol:
+                count += 1
+            else:
+                break
+        return count
+
+    def render(self, mode='human'):
+        pass
+
+    def close(self):
+        p.disconnect()
+
+class RewardPlotCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+
+    def _on_step(self) -> bool:
+        if self.locals.get('dones'):
+            self.episode_rewards.append(self.locals['rewards'])
+        return True
+
+    def plot(self):
+        plt.figure()
+        plt.plot(self.episode_rewards)
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.title('Learning Curve')
+        plt.show()
+
+if __name__ == '__main__':
+    env = StackBlocksEnv(gui=True, max_steps=500, exploration_episodes=100)
+    model = PPO('MlpPolicy', env, verbose=1, learning_rate=1e-3)
+    callback = RewardPlotCallback()
+    model.learn(total_timesteps=500_000, callback=callback)
+    model.save('stacking_model_slc.zip')
+    callback.plot()

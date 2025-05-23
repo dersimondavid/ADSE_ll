@@ -1,0 +1,158 @@
+import gym
+import numpy as np
+import pybullet as p
+import pybullet_data
+import time
+from gym import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+import matplotlib.pyplot as plt
+
+class StackBlocksEnv(gym.Env):
+    """
+    Gym environment for stacking 10 blocks using a Franka Panda arm in PyBullet.
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, gui=True):
+        super(StackBlocksEnv, self).__init__()
+        # PyBullet setup
+        self.gui = gui
+        if self.gui:
+            p.connect(p.GUI)
+        else:
+            p.connect(p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+
+        # Load plane and table
+        p.loadURDF("plane.urdf")
+        self.table = p.loadURDF("table/table.urdf", [0.5, 0, -0.65], useFixedBase=True)
+        # Draw red mark for stacking area
+        p.addUserDebugLine([0.2, -0.2, 0], [0.2, 0.2, 0], [1,0,0], 2)
+        p.addUserDebugLine([0.2, 0.2, 0], [0.8, 0.2, 0], [1,0,0], 2)
+        p.addUserDebugLine([0.8, 0.2, 0], [0.8, -0.2, 0], [1,0,0], 2)
+        p.addUserDebugLine([0.8, -0.2, 0], [0.2, -0.2, 0], [1,0,0], 2)
+
+        # Load Franka Panda arm
+        self.robot = p.loadURDF("franka_panda/panda.urdf", [0,0,0], useFixedBase=True)
+        self.num_joints = p.getNumJoints(self.robot)
+        # Joint indices for actuated joints (first 7) and gripper (joint 9 & 11)
+        self.arm_joints = list(range(7))
+        self.gripper_joints = [9, 11]
+
+        # Blocks setup
+        self.num_blocks = 10
+        self.block_ids = []
+        self.block_size = 0.04  # 4cm cubes
+        # Gym spaces: 7 arm joints + 2 gripper, continuous
+        self.action_space = spaces.Box(low=-1, high=1, shape=(9,), dtype=np.float32)
+        # Observation: joint positions + block positions
+        obs_dim = 7 + self.num_blocks * 3
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+
+        self.reset()
+
+    def reset(self):
+        # Reset simulation
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.81)
+        p.loadURDF("plane.urdf")
+        p.loadURDF("table/table.urdf", [0.5, 0, -0.65], useFixedBase=True)
+        self.robot = p.loadURDF("franka_panda/panda.urdf", [0,0,0], useFixedBase=True)
+        # Reload blocks at random positions on table
+        self.block_ids = []
+        for i in range(self.num_blocks):
+            x = np.random.uniform(0.2, 0.8)
+            y = np.random.uniform(-0.2, 0.2)
+            z = self.block_size/2
+            bid = p.loadURDF("cube.urdf", [x, y, z], globalScaling=self.block_size/0.5)
+            self.block_ids.append(bid)
+        # Scan and remember block positions
+        self.initial_block_positions = [p.getBasePositionAndOrientation(bid)[0] for bid in self.block_ids]
+
+        # Return initial observation
+        return self._get_obs()
+
+    def step(self, action):
+        # Map action to joint targets
+        # action[:7] -> joint position changes, action[7:] -> gripper open/close
+        for idx, j in enumerate(self.arm_joints):
+            target = p.getJointState(self.robot, j)[0] + float(action[idx]) * 0.05
+            p.setJointMotorControl2(self.robot, j, p.POSITION_CONTROL, target)
+        grip = float(action[7])
+        # Two gripper fingers mirrored
+        p.setJointMotorControl2(self.robot, self.gripper_joints[0], p.POSITION_CONTROL, grip)
+        p.setJointMotorControl2(self.robot, self.gripper_joints[1], p.POSITION_CONTROL, grip)
+
+        # Step simulation
+        p.stepSimulation()
+        if self.gui:
+            time.sleep(1./240.)
+
+        obs = self._get_obs()
+        reward = self._compute_reward()
+        done = reward >= self.num_blocks
+        info = {}
+        return obs, reward, done, info
+
+    def _get_obs(self):
+        # Robot joint positions
+        joints = [p.getJointState(self.robot, j)[0] for j in self.arm_joints]
+        # Block positions
+        blocks = []
+        for bid in self.block_ids:
+            pos, _ = p.getBasePositionAndOrientation(bid)
+            blocks.extend(list(pos))
+        return np.array(joints + blocks, dtype=np.float32)
+
+    def _compute_reward(self):
+        # Reward = number of blocks correctly stacked
+        count = 0
+        eps = 0.02
+        # Ideal stacking center
+        cx, cy = 0.5, 0.0
+        for i, bid in enumerate(self.block_ids):
+            pos, _ = p.getBasePositionAndOrientation(bid)
+            # Height target = (i+0.5)*block_size
+            target_z = (i + 0.5) * self.block_size
+            if abs(pos[2] - target_z) < eps and np.hypot(pos[0]-cx, pos[1]-cy) < eps:
+                count += 1
+            else:
+                break
+        return float(count)
+
+    def render(self, mode='human'):
+        # GUI is always on
+        pass
+
+    def close(self):
+        p.disconnect()
+
+# Callback to record and plot rewards\ 
+class RewardPlotCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(RewardPlotCallback, self).__init__(verbose)
+        self.episode_rewards = []
+
+    def _on_step(self) -> bool:
+        if self.locals.get('dones'):
+            ep_rew = self.locals['rewards']
+            self.episode_rewards.append(ep_rew)
+        return True
+
+    def plot(self):
+        plt.figure()
+        plt.plot(self.episode_rewards)
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.title('Learning Curve')
+        plt.show()
+
+if __name__ == '__main__':
+    env = StackBlocksEnv(gui=True)
+    model = PPO('MlpPolicy', env, verbose=1)
+    callback = RewardPlotCallback()
+    # Train until 10-block tower is built consistently
+    model.learn(total_timesteps=1_000_000, callback=callback)
+    callback.plot()

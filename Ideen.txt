@@ -1,0 +1,9 @@
+https://pybullet.org/wordpress/
+
+- 3D-Roboterarm, der einen Turm stapeln soll oder irgendwas anderes 
+	- https://www.youtube.com/watch?v=oR_PKYFdrEs
+
+- TicTacToe Spiel implementieren
+- Vier gewinnt implementieren
+
+
