@@ -74,16 +74,16 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         self.current_phase = "approach"  # approach, position, descend, grasp, transport
         self.phase_timeouts = {
             'approach': 200,    # Max Steps für Annäherung
-            'position': 100,    # Max Steps für Positionierung  
-            'descend': 50,      # Max Steps für Absenkung
-            'grasp': 30,        # Max Steps für Greifen
+            'position': 150,    # ERWEITERT: Mehr Zeit für präzise Positionierung  
+            'descend': 60,      # Etwas mehr Zeit für kontrollierte Absenkung
+            'grasp': 40,        # Etwas mehr Zeit für sicheres Greifen
             'transport': 200    # Max Steps für Transport
         }
         self.phase_start_step = 0
         self.phase_success_criteria = {
-            'approach': 0.15,   # Abstand zum Würfel
-            'position': 0.06,   # XY-Abstand über Würfel
-            'descend': 0.03,    # Höhe über Würfel
+            'approach': 0.12,   # Abstand zum Würfel (erweitert)
+            'position': 0.04,   # XY-Abstand über Würfel (präziser)
+            'descend': 0.025,   # Höhe über Würfel (präziser)
             'grasp': True,      # Würfel gegriffen
             'transport': 0.1    # Abstand zum Ziel
         }
@@ -183,7 +183,7 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         self.cube_id = p.loadURDF("cube.urdf", 
                                   basePosition=[0, 0, 0], 
                                   baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
-                                  globalScaling=0.04)
+                                  globalScaling=0.074)
         
         # Kiste (Tray) - FESTE Position
         tray_pos = [0.5, 0.0, 0.02]
@@ -569,52 +569,42 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         cube_width = 0.05  # Breite des Würfels
         finger_offset = 0.002  # Kleiner Offset für besseren Kontakt
         
-        # Wenn nah am Würfel
-        if distance_to_cube < 0.08:
-            if self.grasp_constraint is None:  # Wenn noch nicht gegriffen
-                # Phase 1: Annäherung - Greifer weit öffnen
-                if xy_distance > 0.04:
-                    target_open = 0.15  # Weit geöffnet
-                    for joint_idx in [self.left_finger_index, self.right_finger_index]:
-                        p.setJointMotorControl2(
-                            self.robot_id, joint_idx, p.POSITION_CONTROL,
-                            targetPosition=target_open,
-                            force=50,  # Reduced force for smoother movement
-                            maxVelocity=0.05,  # Slow movement
-                            positionGain=0.5,  # Reduced position gain
-                            velocityGain=0.1  # Reduced velocity gain
-                        )
-                
-                # Phase 2: Präzises Greifen an den Kanten
-                elif xy_distance < 0.04:
-                    # Low friction for initial contact
-                    self._configure_finger_dynamics(self.left_finger_index, 0.001, 0.001)
-                    self._configure_finger_dynamics(self.right_finger_index, 0.001, 0.001)
-                    
-                    # Calculate exact cube edge positions
-                    left_edge = -(cube_width/2) * relative_orn[0,0]
-                    right_edge = (cube_width/2) * relative_orn[0,0]
-                    
-                    # Set finger positions with precise control
-                    p.setJointMotorControlArray(
-                        self.robot_id,
-                        [self.left_finger_index, self.right_finger_index],
-                        p.POSITION_CONTROL,
-                        targetPositions=[left_edge, right_edge],
-                        forces=[50, 50],  # Reduced force for precise control
-                        positionGains=[0.5, 0.5],  # Reduced position gain
-                        velocityGains=[0.1, 0.1]  # Reduced velocity gain
-                    )
-                    
-                    # Wait for finger movement
-                    for _ in range(15):
-                        p.stepSimulation()
-                        if self.gui:
-                            time.sleep(1./240.)
-                            
-                    # After contact, increase friction for stable grasp
-                    self._configure_finger_dynamics(self.left_finger_index, 100.0, 10.0)
-                    self._configure_finger_dynamics(self.right_finger_index, 100.0, 10.0)
+        # Greifer-Logik nach Phase
+        if distance_to_cube < 0.08 and self.grasp_constraint is None:
+            # Annäherung oder Absenken: Greifer weit öffnen
+            if self.current_phase in ["approach", "position", "descend"]:
+                target_open = 0.15
+                for joint_idx in [self.left_finger_index, self.right_finger_index]:
+                    p.setJointMotorControl2(
+                        self.robot_id, joint_idx, p.POSITION_CONTROL,
+                        targetPosition=target_open,
+                        force=50, maxVelocity=0.05, positionGain=0.5, velocityGain=0.1)
+            # Erst in der grasp-Phase präzise schließen
+            elif self.current_phase == "grasp":
+                # Low friction for initial contact
+                self._configure_finger_dynamics(self.left_finger_index, 0.001, 0.001)
+                self._configure_finger_dynamics(self.right_finger_index, 0.001, 0.001)
+                # Calculate exact cube edge positions
+                left_edge = -(cube_width/2) * relative_orn[0,0]
+                right_edge = (cube_width/2) * relative_orn[0,0]
+                # Set finger positions with precise control
+                p.setJointMotorControlArray(
+                    self.robot_id,
+                    [self.left_finger_index, self.right_finger_index],
+                    p.POSITION_CONTROL,
+                    targetPositions=[left_edge, right_edge],
+                    forces=[50, 50],
+                    positionGains=[0.5, 0.5],
+                    velocityGains=[0.1, 0.1]
+                )
+                # Wait for finger movement
+                for _ in range(15):
+                    p.stepSimulation()
+                    if self.gui:
+                        time.sleep(1./240.)
+                # After contact, increase friction for stable grasp
+                self._configure_finger_dynamics(self.left_finger_index, 100.0, 10.0)
+                self._configure_finger_dynamics(self.right_finger_index, 100.0, 10.0)
                 
             # Kontakt-Belohnung
             try:
@@ -789,9 +779,9 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         target_pos = current_end_effector_pos + position_delta
         
         # ERWEITERTE Arbeitsraum-Limits für bessere Sicherheit
-        target_pos[0] = np.clip(target_pos[0], -0.6, 0.8)   # X-Limits (erweitert)
+        target_pos[0] = np.clip(target_pos[0], -0.6, 0.8)   # X-Limits 
         target_pos[1] = np.clip(target_pos[1], -0.6, 0.6)   # Y-Limits  
-        target_pos[2] = np.clip(target_pos[2], 0.08, 0.7)   # Z-Limits (nicht zu tief)
+        target_pos[2] = np.clip(target_pos[2], 0.035, 0.7)   # Z-Limits 
         
         # INVERSE KINEMATIK
         target_orientation = p.getQuaternionFromEuler([0, math.pi, 0])  # Greifer nach unten
@@ -836,12 +826,11 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         
         # Standardisierte Greifer-Positionierung
         if distance_to_cube < 0.15:  # Wenn nah am Würfel
-            if height_above_cube > 0.05:  # Wenn noch über dem Würfel
-                # Greifer weit öffnen für Annäherung
-                gripper_target = 0.04
-            elif height_above_cube <= 0.05 and xy_distance < 0.03:  # Direkt über dem Würfel
-                # Optimale Greifposition einnehmen
-                gripper_target = 0.025  # Feste, optimale Position für Würfelgriff
+            if xy_distance < 0.025:
+                if height_above_cube > 0.012:  # Noch über dem Würfel: immer weit öffnen
+                    gripper_target = 0.2
+                elif height_above_cube <= 0.03:  # Direkt über dem Würfel: schließen
+                    gripper_target = 0.025  # Feste, optimale Position für Würfelgriff
             else:
                 # Normale Steuerung wenn nicht in Greifposition
                 if gripper_command > 0.3:  # Schließen
@@ -927,63 +916,69 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         # Sichere Phasen-Abruf mit Fallback
         prev_level = self.phase_hierarchy.get(previous_phase, 1)
         new_level = self.phase_hierarchy.get(new_phase, 1)
-        
         level_change = new_level - prev_level
-        
+
         # Phasen-Historie aktualisieren
         if not hasattr(self, 'phase_history'):
             self.phase_history = []
         self.phase_history.append((self.episode_step, previous_phase, new_phase, level_change))
-        
         # Behalte nur letzte 10 Transitions für Debugging
         if len(self.phase_history) > 10:
             self.phase_history.pop(0)
-        
+
+        # Wiederholte Wechsel zwischen denselben Phasen bestrafen
+        repeat_penalty = 0.0
+        if len(self.phase_history) >= 2:
+            last = self.phase_history[-2]
+            if last[1] == new_phase and last[2] == previous_phase:
+                # Hin- und Herwechseln zwischen zwei Phasen
+                repeat_penalty = -2.0  # Kleine Strafe für Phase-Bouncing
+
         if level_change > 0:
             # FORTSCHRITT: Positive Belohnung
-            progress_reward = 15.0 + (level_change * 5.0)  # Größere Sprünge = mehr Belohnung
-            
-            # Bonus für besonders wichtige Übergänge
+            progress_reward = 0.0 + (level_change * 0)  # Reduzierte Grundbelohnung
+
+            # Reduzierte Boni für kritische Übergänge
             bonus = 0.0
             if previous_phase == "position" and new_phase == "descend":
-                bonus = 10.0  # Endlich vom Hovering zur Absenkung!
+                bonus = 0  # Reduzierter Bonus
             elif previous_phase == "descend" and new_phase == "grasp":
-                bonus = 15.0  # Successful contact and grasp
+                bonus = 0  # Deutlich reduzierter Bonus
             elif previous_phase == "grasp" and new_phase == "transport":
-                bonus = 20.0  # Successful pickup!
-                
-            total_reward = progress_reward + bonus
+                bonus = 0  # Deutlich reduzierter Bonus
+
+            total_reward = progress_reward + bonus + repeat_penalty
             info = f"PHASE_PROGRESS({previous_phase}->{new_phase},+{total_reward:.1f}) "
-            
+
             if self.debug_mode:
                 pass
                 #print(f"  ✅ PHASEN-FORTSCHRITT: {previous_phase}(Lv{prev_level}) -> {new_phase}(Lv{new_level}) = +{total_reward:.1f}")
-            
+
         elif level_change < 0:
             # RÜCKFALL: Negative Belohnung (Bestrafung)
-            regression_penalty = -8.0 + (level_change * 3.0)  # Größere Rückfälle = mehr Strafe
-            
+            regression_penalty = 0 + (level_change * 0)  # Größere Rückfälle = mehr Strafe
+
             # Besonders schwere Strafen für kritische Rückfälle
             penalty = 0.0
             if new_phase == "approach" and prev_level > 2:
-                penalty = -10.0  # Zurück zur Annäherung ist schlecht
+                penalty = 0  # Zurück zur Annäherung ist schlecht
             elif new_phase == "position" and previous_phase == "grasp":
-                penalty = -15.0  # Würfel verloren nach Griff!
+                penalty = 0  # Würfel verloren nach Griff!
             elif new_phase == "approach" and previous_phase == "transport":
-                penalty = -25.0  # Katastrophaler Rückfall: Würfel verloren beim Transport
-                
-            total_reward = regression_penalty + penalty
+                penalty = 0  # Katastrophaler Rückfall: Würfel verloren beim Transport
+
+            total_reward = regression_penalty + penalty + repeat_penalty
             info = f"PHASE_REGRESSION({previous_phase}->{new_phase},{total_reward:.1f}) "
-            
+
             if self.debug_mode:
                 pass
                 #print(f"  ❌ PHASEN-RÜCKFALL: {previous_phase}(Lv{prev_level}) -> {new_phase}(Lv{new_level}) = {total_reward:.1f}")
-            
+
         else:
             # Keine Phasen-Änderung (sollte nicht aufgerufen werden)
-            total_reward = 0.0
-            info = f"PHASE_SAME({new_phase},0.0) "
-        
+            total_reward = 0.0 + repeat_penalty
+            info = f"PHASE_SAME({new_phase},{total_reward:.1f}) "
+
         return total_reward, info
 
     def compute_reward(self, achieved_goal, desired_goal, info):
@@ -1073,9 +1068,9 @@ class RobotArmPickPlaceEnvHER(gym.Env):
                     phase_info += f"POSITIONING({xy_improvement:.3f}) "
             self.last_xy_distance = xy_distance
               # KRITISCH: Anti-Hovering Mechanismus
-            hover_reward, hover_info = self._apply_anti_hovering_penalty(xy_distance, height_above_cube, end_effector_pos)
-            total_reward += hover_reward
-            phase_info += hover_info
+            #hover_reward, hover_info = self._apply_anti_hovering_penalty(xy_distance, height_above_cube, end_effector_pos)
+            #total_reward += hover_reward
+            #phase_info += hover_info
             
         elif self.current_phase == "descend":
             # Absenkung wird stark belohnt
@@ -1085,7 +1080,7 @@ class RobotArmPickPlaceEnvHER(gym.Env):
                     descent_reward = z_movement * 300.0  # SEHR STARKE Belohnung für Absenkung
                     total_reward += descent_reward
                     phase_info += f"DESCENDING({descent_reward:.1f}) "
-                elif z_movement < -0.002:  # Aufwärtsbewegung bestraft
+                elif z_movement < -0.0001:  # Aufwärtsbewegung bestraft
                     total_reward -= 20.0
                     phase_info += "GOING_UP(-20) "
             
@@ -1103,10 +1098,18 @@ class RobotArmPickPlaceEnvHER(gym.Env):
             if not is_grasped and hasattr(self, 'last_z_pos') and self.last_z_pos is not None:
                 z_movement = self.last_z_pos - end_effector_pos[2]  # Positiv = Absenkung
                 if z_movement > 0.001:  # Signifikante Absenkung belohnen
-                    descent_reward = z_movement * 200.0  # Starke Belohnung
+                    descent_reward = z_movement * 100.0  # Starke Belohnung
                     total_reward += descent_reward
                     phase_info += f"GRASP_DESCENT({descent_reward:.1f}) "
-            
+                elif z_movement < -0.0001:  # Aufwärtsbewegung bestraft (wie in descend)
+                    total_reward -= 20.0
+                    phase_info += "GOING_UP(-20) "
+
+            # Hovering-Bestrafung wie in position-Phase
+            #hover_reward, hover_info = self._apply_anti_hovering_penalty(xy_distance, height_above_cube, end_effector_pos)
+            #total_reward += hover_reward
+            #phase_info += hover_info
+
             # Z-Position für nächsten Step aktualisieren
             self.last_z_pos = end_effector_pos[2]
 
@@ -1164,19 +1167,24 @@ class RobotArmPickPlaceEnvHER(gym.Env):
         return float(total_reward)
     
     def _update_current_phase(self, gripper_to_cube_dist, xy_distance, height_above_cube, is_grasped, cube_to_target_dist):
-        
         if is_grasped and cube_to_target_dist > self.distance_threshold:
             self.current_phase = "transport"
         elif is_grasped:
-            self.current_phase = "transport"  # Auch bei Erfolg
-        elif gripper_to_cube_dist < 0.15 and xy_distance < 0.06 and height_above_cube < 0.08:
+            self.current_phase = "transport"
+        # Grasp: Sehr exakt über dem Würfel (an der Kante) und sehr nah dran
+        elif gripper_to_cube_dist < 0.045 and xy_distance < 0.015 and height_above_cube <= 0.04:
             self.current_phase = "grasp"
-        elif gripper_to_cube_dist < 0.15 and xy_distance < 0.06 and height_above_cube > 0.08:
+        # Descend: Gut über dem Würfel positioniert, im Absenkbereich
+        elif gripper_to_cube_dist < 0.065 and xy_distance < 0.02 and 0.035 < height_above_cube <= 0.08:
             self.current_phase = "descend"
-        elif gripper_to_cube_dist < 0.15:            self.current_phase = "position"
-        else:
+        # Position: Annäherung an optimale XY-Position über dem Würfel (ERWEITERT)
+        elif gripper_to_cube_dist <= 0.12 and xy_distance < 0.04 and height_above_cube > 0.08:
+            self.current_phase = "position"
+        # Approach: Allgemeine Annäherung an den Würfel
+        elif gripper_to_cube_dist < 0.2:
             self.current_phase = "approach"
     
+
     def _apply_anti_hovering_penalty(self, xy_distance, height_above_cube, end_effector_pos):
         # VERSTÄRKTE Anti-Hovering Mechanismen
         
@@ -1489,7 +1497,7 @@ class SAC_HER_TrainingCallback(BaseCallback):
         plt.suptitle(f'SAC+HER Training Progress - Step {self.n_calls:,}', fontsize=16, fontweight='bold')
         plt.tight_layout()
         
-        plot_path = os.path.join(self.save_path, f'sac_her_training_plot_{self.n_calls}.png')
+        plot_path = os.path.join(self.save_path, f'sac_her_training_plot_{self.n_calls}')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Plot gespeichert: {plot_path}")
