@@ -130,7 +130,7 @@ class RobotArmPickPlaceEnv(gym.Env):
         self.success = False
         
         # Physik stabilisieren
-        for _ in range(50):p
+        for _ in range(50):
             p.stepSimulation()
             
         return self._get_observation()
